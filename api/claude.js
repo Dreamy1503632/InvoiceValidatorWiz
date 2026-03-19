@@ -15,7 +15,7 @@ export default async function handler(req, res) {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
     const { messages, max_tokens } = body;
 
-    // Build Gemini parts from Anthropic message format
+    // Convert Anthropic message format → Gemini parts
     const parts = [];
     for (const msg of messages) {
       const content = msg.content;
@@ -37,65 +37,42 @@ export default async function handler(req, res) {
       }
     }
 
-    // Try models in order until one works
-    const MODELS = [
-      'gemini-2.0-flash',
-      'gemini-2.0-flash-lite',
-      'gemini-1.5-flash-latest',
-      'gemini-1.5-flash-8b',
-    ];
-
-    let lastError = null;
-
-    for (const model of MODELS) {
-      try {
-        const geminiRes = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{ role: 'user', parts }],
-              generationConfig: {
-                maxOutputTokens: max_tokens || 2000,
-                temperature: 0.1,
-              },
-              systemInstruction: {
-                parts: [{
-                  text: 'You are an expert document parser. Always return ONLY valid raw JSON with no markdown fences, no explanation, no preamble. Just the JSON object starting with { and ending with }.'
-                }]
-              }
-            })
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts }],
+          systemInstruction: {
+            parts: [{
+              text: 'You are an expert document parser. Always return ONLY a valid raw JSON object. No markdown, no code fences, no explanation. Start with { and end with }.'
+            }]
+          },
+          generationConfig: {
+            maxOutputTokens: max_tokens || 2000,
+            temperature: 0.1
           }
-        );
-
-        const geminiData = await geminiRes.json();
-
-        if (geminiData.error) {
-          lastError = geminiData.error.message;
-          continue; // try next model
-        }
-
-        const text = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-        if (!text) {
-          lastError = 'Empty response from model ' + model;
-          continue;
-        }
-
-        // Success — return in Anthropic format
-        return res.status(200).json({
-          content: [{ type: 'text', text }]
-        });
-
-      } catch (modelErr) {
-        lastError = modelErr.message;
-        continue;
+        })
       }
+    );
+
+    const data = await response.json();
+
+    if (data.error) {
+      return res.status(400).json({ error: data.error.message, detail: data.error });
     }
 
-    // All models failed
-    return res.status(400).json({ error: 'All Gemini models failed. Last error: ' + lastError });
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+    if (!text) {
+      return res.status(500).json({ error: 'Empty response from Gemini' });
+    }
+
+    // Return in Anthropic-compatible format so app code works unchanged
+    return res.status(200).json({
+      content: [{ type: 'text', text }]
+    });
 
   } catch (err) {
     return res.status(500).json({ error: 'Proxy error: ' + err.message });
