@@ -52,10 +52,8 @@ const getFlag  = (invoiceNum, amount, submitterId, allRecords) => {
 };
 
 // ─── Claude API ───────────────────────────────────────────────────────────────
-// Detect if running on Vercel/production or in Claude artifact sandbox
-const API_URL = (typeof window !== "undefined" && window.location.hostname !== "localhost" && !window.location.hostname.includes("claude.ai") && !window.location.hostname.includes("anthropic"))
-  ? "/api/claude"
-  : "https://api.anthropic.com/v1/messages";
+// API proxy endpoint — works on Vercel production
+const API_URL = "/api/claude";
 
 async function claudeCall(messages, tools=[]) {
   const body = { model:"claude-sonnet-4-20250514", max_tokens:2000, messages };
@@ -102,22 +100,29 @@ async function claudeCallWithTools(messages) {
 
 async function agentExtractExpense(file, b64) {
   const isImage = file.type.startsWith("image/");
-  const prompt = `You are a corporate expense receipt parser. Analyze this receipt and extract all information. Return ONLY raw JSON:
+  const prompt = `You are a corporate expense receipt parser. Look carefully at every part of this receipt image and extract ALL visible information.
+
+CRITICAL: Return ONLY a raw JSON object. No markdown, no code fences, no text before or after. Start your response with { and end with }.
+
+Extract these fields:
 {
-  "invoiceNumber":"<receipt/invoice number or AUTO-XXXX>",
-  "invoiceDate":"<YYYY-MM-DD>",
-  "sellerName":"<merchant/vendor>",
-  "totalAmount":"<numeric only>",
-  "taxAmount":"<numeric or 0>",
-  "currency":"<INR/USD/EUR etc>",
-  "receiptType":"<Food & Beverage|Conveyance|Accommodation|Air Travel|Rail Travel|Fuel|Parking|Office Supplies|Telecom|Medical|Entertainment|Other>",
-  "lineItems":"<brief summary of items>",
-  "gstNumber":"<GST/VAT if present, else empty>",
-  "paymentMode":"<Cash|Card|UPI|Bank Transfer|Other|Unknown>",
-  "validationIssues":["<any data quality problems>"],
-  "agentNotes":"<observations>",
-  "confidence":"HIGH|MEDIUM|LOW"
-}`;
+  "invoiceNumber": "the receipt/bill/invoice number printed on the document, or generate AUTO-XXXX if not found",
+  "invoiceDate": "date in YYYY-MM-DD format",
+  "sellerName": "the shop, restaurant, hotel, airline or vendor name",
+  "totalAmount": "the final total amount paid as a number only, no currency symbol",
+  "taxAmount": "tax amount as number only, or 0",
+  "currency": "INR or USD or EUR etc",
+  "receiptType": "Food & Beverage or Conveyance or Accommodation or Air Travel or Rail Travel or Fuel or Parking or Office Supplies or Telecom or Medical or Entertainment or Other",
+  "lineItems": "brief list of items purchased",
+  "gstNumber": "GST or VAT registration number if shown, else empty string",
+  "paymentMode": "Cash or Card or UPI or Bank Transfer or Other or Unknown",
+  "validationIssues": [],
+  "agentNotes": "any useful observations",
+  "confidence": "HIGH or MEDIUM or LOW"
+}
+
+Look carefully for: total amount, grand total, amount due, amount paid — these are the most important fields.`;
+
   try {
     let msgContent;
     if (isImage) {
@@ -126,7 +131,6 @@ async function agentExtractExpense(file, b64) {
         { type:"text", text:prompt }
       ];
     } else {
-      // PDF — use PDF.js to extract real text content
       const pdfText = await extractPDFText(file);
       const pdfContent = pdfText.length > 50
         ? `\n\nDOCUMENT CONTENT:\n---\n${pdfText.slice(0,3000)}\n---`
@@ -134,8 +138,9 @@ async function agentExtractExpense(file, b64) {
       msgContent = [{ type:"text", text: prompt + pdfContent }];
     }
     return await claudeCall([{ role:"user", content: msgContent }]);
-  } catch {
-    return { invoiceNumber:`AUTO-${uid()}`, invoiceDate:today(), sellerName:"Unknown", totalAmount:"0", taxAmount:"0", currency:"INR", receiptType:"Other", lineItems:"", gstNumber:"", paymentMode:"Unknown", validationIssues:["Extraction failed"], agentNotes:"", confidence:"LOW" };
+  } catch(err) {
+    console.error("Expense extraction error:", err.message);
+    return { invoiceNumber:`AUTO-${uid()}`, invoiceDate:today(), sellerName:"Unknown", totalAmount:"0", taxAmount:"0", currency:"INR", receiptType:"Other", lineItems:"", gstNumber:"", paymentMode:"Unknown", validationIssues:["Extraction failed: " + err.message], agentNotes:"", confidence:"LOW" };
   }
 }
 
@@ -185,52 +190,53 @@ async function agentExtractTravel(file, b64, employeeName) {
 
   const prompt = `You are a corporate travel document parser. The logged-in employee is: "${employeeName}".
 
-Analyze this travel document carefully — it may be a flight e-ticket, boarding pass, hotel booking confirmation, or travel itinerary.
-Return ONLY a raw JSON object. No markdown, no code fences, no explanation — just the JSON.
+Look carefully at every detail in this travel document (flight e-ticket, boarding pass, hotel booking, or itinerary).
+
+CRITICAL: Return ONLY a raw JSON object. Start your response with { and end with }. No markdown, no code fences, no text before or after.
 
 {
   "travelType": "Flight or Hotel",
-  "passengerName": "exact full name as printed on document, empty string if not found",
-  "nameMatchesEmployee": true or false (true if passenger name matches or is a close match to ${employeeName}),
-  "nameMatchNote": "brief reason",
+  "passengerName": "exact full name printed on the document",
+  "nameMatchesEmployee": true or false,
+  "nameMatchNote": "brief reason why names match or not",
   "flight": {
-    "origin": "departure city or IATA airport code",
-    "destination": "arrival city or IATA airport code",
-    "flightNumber": "e.g. AI302 or 6E441",
+    "origin": "departure city or airport code",
+    "destination": "arrival city or airport code",
+    "flightNumber": "airline code + number e.g. AI864",
     "cabinClass": "Economy or Premium Economy or Business or First",
     "departureDate": "YYYY-MM-DD",
     "returnDate": "YYYY-MM-DD or null",
     "passengers": 1,
     "estimatedDistanceKm": 1200,
     "flightCategory": "Domestic (<500km) or Short-Haul (500-1500km) or Medium-Haul (1500-4000km) or Long-Haul (>4000km)",
-    "pnr": "booking reference",
-    "ticketCost": "1234.00",
-    "currency": "INR",
-    "invoiceNumber": "ticket or booking number"
+    "pnr": "booking reference or PNR code",
+    "ticketCost": "total fare amount as number only",
+    "currency": "INR or USD etc",
+    "invoiceNumber": "ticket number or booking ID"
   },
   "hotel": {
     "hotelName": "hotel name",
-    "city": "city",
+    "city": "city name",
     "checkIn": "YYYY-MM-DD",
     "checkOut": "YYYY-MM-DD",
-    "nights": 2,
-    "roomType": "Standard",
+    "nights": 1,
+    "roomType": "Standard or Deluxe etc",
     "guests": 1,
-    "bookingRef": "reference",
-    "cost": "5000.00",
-    "currency": "INR",
+    "bookingRef": "booking reference",
+    "cost": "total cost as number only",
+    "currency": "INR or USD etc",
     "invoiceNumber": "booking number"
   },
   "validationIssues": [],
-  "agentNotes": "any observations",
+  "agentNotes": "observations",
   "confidence": "HIGH or MEDIUM or LOW"
 }
 
-Critical rules:
+Rules:
 1. Set flight to null for hotel documents. Set hotel to null for flight documents.
-2. estimatedDistanceKm: estimate the great-circle flying distance between the two cities in km.
-3. If the document name does not match "${employeeName}", add a name mismatch entry to validationIssues.
-4. Even if data is partial, fill every field you can — do not leave fields blank if you can infer them.`;
+2. For Mumbai-Delhi flights, estimatedDistanceKm is approximately 1150.
+3. If passengerName does not match "${employeeName}", add that to validationIssues.
+4. Fill every field you can see — ticketCost and totalAmount are the most important.`;
 
   try {
     let msgContent;
@@ -287,33 +293,37 @@ async function extractPDFText(file) {
     const reader = new FileReader();
     reader.onload = async (e) => {
       try {
-        // Load PDF.js from CDN if not already loaded
-        if (!window.pdfjsLib) {
-          await new Promise((res, rej) => {
-            const script = document.createElement("script");
-            script.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
-            script.onload = res; script.onerror = rej;
-            document.head.appendChild(script);
-          });
-          window.pdfjsLib.GlobalWorkerOptions.workerSrc =
-            "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+        // Try PDF.js if available
+        const pdfjs = window.pdfjsLib;
+        if (pdfjs) {
+          if (!pdfjs.GlobalWorkerOptions.workerSrc) {
+            pdfjs.GlobalWorkerOptions.workerSrc =
+              "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+          }
+          const pdf = await pdfjs.getDocument({ data: e.target.result }).promise;
+          let fullText = "";
+          for (let p = 1; p <= pdf.numPages; p++) {
+            const page = await pdf.getPage(p);
+            const content = await page.getTextContent();
+            fullText += content.items.map(i => i.str).join(" ") + "\n";
+          }
+          return resolve(fullText.trim());
         }
-        const pdf = await window.pdfjsLib.getDocument({ data: e.target.result }).promise;
-        let fullText = "";
-        for (let p = 1; p <= pdf.numPages; p++) {
-          const page = await pdf.getPage(p);
-          const content = await page.getTextContent();
-          fullText += content.items.map(i => i.str).join(" ") + "\n";
-        }
-        resolve(fullText.trim());
-      } catch (err) {
-        resolve(""); // fallback — will let Claude handle gracefully
+        // Fallback: extract readable ASCII text from raw bytes
+        const bytes = new Uint8Array(e.target.result);
+        const raw = new TextDecoder("latin-1").decode(bytes);
+        const chunks = raw.match(/[\x20-\x7E\n\r\t]{4,}/g) || [];
+        const text = chunks.filter(c => /[a-zA-Z]{2,}/.test(c)).join("\n");
+        resolve(text.slice(0, 4000));
+      } catch {
+        resolve("");
       }
     };
     reader.onerror = () => resolve("");
     reader.readAsArrayBuffer(file);
   });
 }
+
 const SEED_USERS = [
   { id:"ADM001", username:"admin", password:hashPwd("admin123"), role:"admin", name:"System Admin", serviceLine:"Others", costCentre:"Others", projectWBS:"", email:"admin@company.com", managerId:"" },
 ];
