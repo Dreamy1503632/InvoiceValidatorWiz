@@ -52,18 +52,26 @@ const getFlag  = (invoiceNum, amount, submitterId, allRecords) => {
 };
 
 // ─── Claude API ───────────────────────────────────────────────────────────────
+// Detect if running on Vercel/production or in Claude artifact sandbox
+const API_URL = (typeof window !== "undefined" && window.location.hostname !== "localhost" && !window.location.hostname.includes("claude.ai") && !window.location.hostname.includes("anthropic"))
+  ? "/api/claude"
+  : "https://api.anthropic.com/v1/messages";
+
 async function claudeCall(messages, tools=[]) {
   const body = { model:"claude-sonnet-4-20250514", max_tokens:2000, messages };
   if (tools.length) body.tools = tools;
-  const res = await fetch("/api/claude", {
+  const res = await fetch(API_URL, {
     method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)
   });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`API error ${res.status}: ${errText.slice(0,200)}`);
+  }
   const d = await res.json();
-  // Collect all text blocks — works with or without tool use
+  if (d.error) throw new Error(d.error.message || d.error);
   const allText = (d.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
   const cleaned = allText.replace(/```json\n?|```/g,"").trim();
   if (!cleaned) throw new Error("Empty response from AI");
-  // Extract JSON object from response (handles extra text around it)
   const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
   if (!jsonMatch) throw new Error("No JSON found in response");
   return JSON.parse(jsonMatch[0]);
@@ -75,11 +83,15 @@ async function claudeCallWithTools(messages) {
     model:"claude-sonnet-4-20250514", max_tokens:2000, messages,
     tools:[{ type:"web_search_20250305", name:"web_search" }]
   };
-  const res = await fetch("/api/claude", {
+  const res = await fetch(API_URL, {
     method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)
   });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`API error ${res.status}: ${errText.slice(0,200)}`);
+  }
   const d = await res.json();
-  // If model used tools, the final text block still contains our JSON
+  if (d.error) throw new Error(d.error.message || d.error);
   const allText = (d.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
   const cleaned = allText.replace(/```json\n?|```/g,"").trim();
   if (!cleaned) throw new Error("Empty response");
