@@ -17,10 +17,8 @@ export default async function handler(req, res) {
 
     // Build Gemini parts from Anthropic message format
     const parts = [];
-
     for (const msg of messages) {
       const content = msg.content;
-
       if (typeof content === 'string') {
         parts.push({ text: content });
       } else if (Array.isArray(content)) {
@@ -28,7 +26,6 @@ export default async function handler(req, res) {
           if (block.type === 'text') {
             parts.push({ text: block.text });
           } else if (block.type === 'image' && block.source) {
-            // Gemini inline image
             parts.push({
               inlineData: {
                 mimeType: block.source.media_type,
@@ -40,51 +37,65 @@ export default async function handler(req, res) {
       }
     }
 
-    // Call Gemini 1.5 Flash (free tier, supports images)
-    const geminiRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts }],
-          generationConfig: {
-            maxOutputTokens: max_tokens || 2000,
-            temperature: 0.1,
-            responseMimeType: 'text/plain'
-          },
-          systemInstruction: {
-            parts: [{
-              text: 'You are an expert document parser. Always return ONLY valid raw JSON with no markdown fences, no explanation, no preamble. Just the JSON object.'
-            }]
+    // Try models in order until one works
+    const MODELS = [
+      'gemini-2.0-flash',
+      'gemini-2.0-flash-lite',
+      'gemini-1.5-flash-latest',
+      'gemini-1.5-flash-8b',
+    ];
+
+    let lastError = null;
+
+    for (const model of MODELS) {
+      try {
+        const geminiRes = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ role: 'user', parts }],
+              generationConfig: {
+                maxOutputTokens: max_tokens || 2000,
+                temperature: 0.1,
+              },
+              systemInstruction: {
+                parts: [{
+                  text: 'You are an expert document parser. Always return ONLY valid raw JSON with no markdown fences, no explanation, no preamble. Just the JSON object starting with { and ending with }.'
+                }]
+              }
+            })
           }
-        })
+        );
+
+        const geminiData = await geminiRes.json();
+
+        if (geminiData.error) {
+          lastError = geminiData.error.message;
+          continue; // try next model
+        }
+
+        const text = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+        if (!text) {
+          lastError = 'Empty response from model ' + model;
+          continue;
+        }
+
+        // Success — return in Anthropic format
+        return res.status(200).json({
+          content: [{ type: 'text', text }]
+        });
+
+      } catch (modelErr) {
+        lastError = modelErr.message;
+        continue;
       }
-    );
-
-    const geminiData = await geminiRes.json();
-
-    // Handle Gemini errors
-    if (geminiData.error) {
-      return res.status(400).json({
-        error: geminiData.error.message || 'Gemini API error',
-        detail: geminiData.error
-      });
     }
 
-    // Extract text from Gemini response
-    const text = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-    if (!text) {
-      return res.status(200).json({
-        content: [{ type: 'text', text: '{"error": "empty response from Gemini"}' }]
-      });
-    }
-
-    // Return in Anthropic format so the app code works unchanged
-    return res.status(200).json({
-      content: [{ type: 'text', text }]
-    });
+    // All models failed
+    return res.status(400).json({ error: 'All Gemini models failed. Last error: ' + lastError });
 
   } catch (err) {
     return res.status(500).json({ error: 'Proxy error: ' + err.message });
