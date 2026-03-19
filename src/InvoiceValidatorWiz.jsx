@@ -55,7 +55,7 @@ const getFlag  = (invoiceNum, amount, submitterId, allRecords) => {
 async function claudeCall(messages, tools=[]) {
   const body = { model:"claude-sonnet-4-20250514", max_tokens:2000, messages };
   if (tools.length) body.tools = tools;
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await fetch("/api/claude", {
     method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)
   });
   const d = await res.json();
@@ -75,7 +75,7 @@ async function claudeCallWithTools(messages) {
     model:"claude-sonnet-4-20250514", max_tokens:2000, messages,
     tools:[{ type:"web_search_20250305", name:"web_search" }]
   };
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await fetch("/api/claude", {
     method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)
   });
   const d = await res.json();
