@@ -260,6 +260,28 @@ function extractPatternLocal(text, patterns) {
   return null;
 }
 
+// City name → IATA code lookup
+const IATA_CITIES = {
+  "BOM":"BOM","DEL":"DEL","BLR":"BLR","MAA":"MAA","HYD":"HYD","CCU":"CCU",
+  "AMD":"AMD","GOI":"GOI","PNQ":"PNQ","COK":"COK","TRV":"TRV","JAI":"JAI",
+  "LKO":"LKO","NAG":"NAG","IXC":"IXC","PAT":"PAT","BHO":"BHO","VNS":"VNS",
+  "MUMBAI":"BOM","BOMBAY":"BOM","DELHI":"DEL","NEW DELHI":"DEL",
+  "BANGALORE":"BLR","BENGALURU":"BLR","CHENNAI":"MAA","MADRAS":"MAA",
+  "HYDERABAD":"HYD","KOLKATA":"CCU","CALCUTTA":"CCU","AHMEDABAD":"AMD",
+  "GOA":"GOI","PUNE":"PNQ","KOCHI":"COK","COCHIN":"COK","TRIVANDRUM":"TRV",
+  "THIRUVANANTHAPURAM":"TRV","JAIPUR":"JAI","LUCKNOW":"LKO","NAGPUR":"NAG",
+  "CHANDIGARH":"IXC","PATNA":"PAT","BHOPAL":"BHO","VARANASI":"VNS",
+  "DUBAI":"DXB","ABU DHABI":"AUH","DOHA":"DOH","SINGAPORE":"SIN",
+  "KUALA LUMPUR":"KUL","BANGKOK":"BKK","HONG KONG":"HKG","TOKYO":"NRT",
+  "SEOUL":"ICN","LONDON":"LHR","PARIS":"CDG","FRANKFURT":"FRA",
+  "AMSTERDAM":"AMS","NEW YORK":"JFK","LOS ANGELES":"LAX","SYDNEY":"SYD",
+};
+function cityToIATA(cityName) {
+  const key = (cityName||"").toUpperCase().trim();
+  return IATA_CITIES[key] || key.slice(0,3).toUpperCase();
+}
+
+
 function calcDistanceLocal(origin, dest) {
   const AP = {
     "BOM":[19.0896,72.8656],"DEL":[28.5562,77.1000],"BLR":[13.1986,77.7066],
@@ -408,9 +430,50 @@ async function agentExtractTravel(file, b64, employeeName) {
     let flight = null, hotel = null;
 
     if (isFlight) {
-      const routeM = text.match(/([A-Z]{3})\s*(?:→|->|to|-)\s*([A-Z]{3})/i);
-      const origin = routeM ? routeM[1].toUpperCase() : extractPatternLocal(text,[/(?:from|origin|departure)[:\s]+([A-Z]{3})/i]) || "";
-      const dest   = routeM ? routeM[2].toUpperCase() : extractPatternLocal(text,[/(?:to|destination|arrival)[:\s]+([A-Z]{3})/i]) || "";
+      // ── Extract origin & destination ──────────────────────────────────────
+      // Handle all common ticket formats:
+      // "Mumbai (BOM) → Delhi (DEL)"
+      // "BOM → DEL"
+      // "Route: Mumbai (BOM) to Delhi (DEL)"
+      // "From: Mumbai   To: Delhi"
+      // "DEP: BOM  ARR: DEL"
+
+      let origin = "", dest = "";
+
+      // Pattern 1: City (CODE) → City (CODE)
+      let m = text.match(/([A-Za-z ]{2,20})\s*\(([A-Z]{3})\)\s*(?:→|->|to|-)\s*([A-Za-z ]{2,20})\s*\(([A-Z]{3})\)/i);
+      if (m) { origin = m[2].toUpperCase(); dest = m[4].toUpperCase(); }
+
+      // Pattern 2: CODE → CODE (bare IATA)
+      if (!origin) {
+        m = text.match(/\b([A-Z]{3})\s*(?:→|->)\s*([A-Z]{3})\b/);
+        if (m) { origin = m[1]; dest = m[2]; }
+      }
+
+      // Pattern 3: Route: CityA to CityB or CityA - CityB
+      if (!origin) {
+        m = text.match(/route[:\s]+([A-Za-z ]{2,20})\s*(?:to|-|→)\s*([A-Za-z ]{2,20})/i);
+        if (m) { origin = cityToIATA(m[1].trim()); dest = cityToIATA(m[2].trim()); }
+      }
+
+      // Pattern 4: From/To labels
+      if (!origin) {
+        const fromM = text.match(/(?:from|origin|dep(?:arture)?|departs?)[:\s]+([A-Z]{3})\b/i)
+                   || text.match(/(?:from|origin|dep(?:arture)?|departs?)[:\s]+([A-Za-z ]{3,25})/i);
+        const toM   = text.match(/(?:to|dest(?:ination)?|arr(?:ival)?|arrives?)[:\s]+([A-Z]{3})\b/i)
+                   || text.match(/(?:to|dest(?:ination)?|arr(?:ival)?|arrives?)[:\s]+([A-Za-z ]{3,25})/i);
+        if (fromM) origin = fromM[1].trim().length === 3 ? fromM[1].toUpperCase() : cityToIATA(fromM[1].trim());
+        if (toM)   dest   = toM[1].trim().length === 3   ? toM[1].toUpperCase()   : cityToIATA(toM[1].trim());
+      }
+
+      // Pattern 5: Two bare IATA codes near each other (last resort)
+      if (!origin) {
+        const codes = [...text.matchAll(/\b([A-Z]{3})\b/g)]
+          .map(x => x[1])
+          .filter(c => IATA_CITIES[c]);
+        if (codes.length >= 2) { origin = codes[0]; dest = codes[1]; }
+      }
+
       const flightNum = (text.match(/\b([A-Z]{2}\s*\d{3,4})\b/) || [])[1] || "";
       const cabin  = /business/i.test(text)?"Business":/first\s*class/i.test(text)?"First":/premium/i.test(text)?"Premium Economy":"Economy";
       const distKm = calcDistanceLocal(origin, dest);
