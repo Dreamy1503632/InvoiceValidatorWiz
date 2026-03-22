@@ -52,242 +52,269 @@ const getFlag  = (invoiceNum, amount, submitterId, allRecords) => {
 };
 
 // ─── Claude API ───────────────────────────────────────────────────────────────
-// API proxy endpoint — works on Vercel production
-const API_URL = "/api/claude";
-
-async function claudeCall(messages, tools=[]) {
-  const body = { model:"claude-sonnet-4-20250514", max_tokens:2000, messages };
-  if (tools.length) body.tools = tools;
-  const res = await fetch(API_URL, {
-    method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)
+// ─── Tesseract.js loader ──────────────────────────────────────────────────────
+async function loadTesseract() {
+  if (window.Tesseract) return window.Tesseract;
+  await new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = "https://unpkg.com/tesseract.js@5/dist/tesseract.min.js";
+    s.onload = res; s.onerror = rej;
+    document.head.appendChild(s);
   });
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`API error ${res.status}: ${errText.slice(0,200)}`);
-  }
-  const d = await res.json();
-  if (d.error) throw new Error(d.error.message || d.error);
-  const allText = (d.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
-  const cleaned = allText.replace(/```json\n?|```/g,"").trim();
-  if (!cleaned) throw new Error("Empty response from AI");
-  const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error("No JSON found in response");
-  return JSON.parse(jsonMatch[0]);
+  return window.Tesseract;
 }
 
-// Multi-turn call that handles tool_use blocks by continuing the conversation
-async function claudeCallWithTools(messages) {
-  const body = {
-    model:"claude-sonnet-4-20250514", max_tokens:2000, messages,
-    tools:[{ type:"web_search_20250305", name:"web_search" }]
+// ─── OCR image using Tesseract.js (browser, free, no API needed) ─────────────
+async function ocrImage(file, b64) {
+  try {
+    const Tesseract = await loadTesseract();
+    const imageData = `data:${file.type};base64,${b64}`;
+    const result = await Tesseract.recognize(imageData, "eng", { logger: () => {} });
+    return result.data.text || "";
+  } catch(e) {
+    return "";
+  }
+}
+
+// ─── Rule-based field extractors ──────────────────────────────────────────────
+function extractAmount(text) {
+  const lines = text.split("\n");
+  const totalRx = /grand\s*total|total\s*amount|amount\s*paid|net\s*amount|total\s*due|total\s*payable|^total$/im;
+  for (const line of lines) {
+    if (totalRx.test(line)) {
+      const nums = line.match(/[\d,]+(?:\.\d{1,2})?/g);
+      if (nums) {
+        const vals = nums.map(n=>parseFloat(n.replace(/,/g,""))).filter(v=>v>0&&v<10000000);
+        if (vals.length) return String(Math.max(...vals));
+      }
+    }
+  }
+  let best = 0;
+  for (const rx of [/₹\s*([\d,]+(?:\.\d{1,2})?)/g, /(?:rs\.?|inr)[:\s]*([\d,]+(?:\.\d{1,2})?)/gi, /total[^\n\d]*([\d,]+(?:\.\d{1,2})?)/gi]) {
+    for (const m of [...text.matchAll(rx)]) {
+      const v = parseFloat(m[1].replace(/,/g,""));
+      if (v > best && v < 10000000) best = v;
+    }
+    if (best > 0) break;
+  }
+  if (best === 0) {
+    const nums = [...text.matchAll(/\b(\d{3,6}(?:\.\d{2})?)\b/g)].map(m=>parseFloat(m[1])).filter(v=>v>=10&&v<500000);
+    if (nums.length) best = Math.max(...nums);
+  }
+  return best > 0 ? String(best) : "0";
+}
+
+function extractDate(text) {
+  const MONTHS = {january:"01",february:"02",march:"03",april:"04",may:"05",june:"06",july:"07",august:"08",september:"09",october:"10",november:"11",december:"12",jan:"01",feb:"02",mar:"03",apr:"04",jun:"06",jul:"07",aug:"08",sep:"09",oct:"10",nov:"11",dec:"12"};
+  let m;
+  if ((m=text.match(/\b(\d{4}[-\/]\d{2}[-\/]\d{2})\b/))) return m[1];
+  if ((m=text.match(/\b(\d{2})[-\/](\d{2})[-\/](\d{4})\b/))) return `${m[3]}-${m[2]}-${m[1]}`;
+  if ((m=text.match(/\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{4})\b/i))) return `${m[3]}-${MONTHS[m[2].toLowerCase()]}-${m[1].padStart(2,"0")}`;
+  if ((m=text.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2}),?\s+(\d{4})\b/i))) return `${m[3]}-${MONTHS[m[1].toLowerCase()]}-${m[2].padStart(2,"0")}`;
+  return null;
+}
+
+function extractSeller(text) {
+  const skip = /^(tax|invoice|receipt|bill|date|time|amount|total|gst|phone|tel|email|address|thank|welcome|\d|#|www\.|http)/i;
+  for (const line of text.split("\n").slice(0,6).map(l=>l.trim()).filter(l=>l.length>2&&l.length<=60)) {
+    if (!skip.test(line)) return line.replace(/\s*(pvt\.?\s*ltd\.?|limited|llp|llc|inc\.?)$/i,"").trim();
+  }
+  return extractPatternLocal(text,[/(?:merchant|vendor|seller|billed\s*by)[:\s]+([A-Za-z &']{3,50})/i]) || "Unknown";
+}
+
+function extractInvoiceNoLocal(text) {
+  return extractPatternLocal(text,[
+    /(?:invoice|bill|receipt)\s*(?:no|#|number|id)[:\s]*([A-Z0-9\-\/]{3,20})/i,
+    /(?:order|txn|transaction|ref)\s*(?:id|no|#)[:\s]*([A-Z0-9\-]{5,20})/i,
+    /\b([A-Z]{2,4}[-\/]?\d{4,10})\b/
+  ]) || `AUTO-${randId()}`;
+}
+
+function extractGSTLocal(text) {
+  const m = text.match(/(?:gstin?|gst\s*no)[:\s]*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])/i);
+  return m ? m[1].toUpperCase() : "";
+}
+
+function extractTaxLocal(text) {
+  const m = text.match(/(?:gst|tax|cgst|sgst|igst)\s*(?:@\s*\d+%)?[:\s₹]*([\d,]+(?:\.\d{1,2})?)/i);
+  if (m) { const v=parseFloat(m[1].replace(/,/g,"")); if(v>0&&v<100000) return String(v); }
+  return "0";
+}
+
+function extractCurrencyLocal(text) {
+  if (/₹|inr|rupee/i.test(text)) return "INR";
+  if (/\$\s*\d|usd|dollar/i.test(text)) return "USD";
+  if (/€|eur|euro/i.test(text)) return "EUR";
+  if (/£|gbp|pound/i.test(text)) return "GBP";
+  if (/aed|dirham/i.test(text)) return "AED";
+  return "INR";
+}
+
+function extractPaymentLocal(text) {
+  if (/upi|gpay|google\s*pay|phonepe|paytm|bhim/i.test(text)) return "UPI";
+  if (/debit\s*card|credit\s*card|visa|mastercard|rupay|amex/i.test(text)) return "Card";
+  if (/net\s*banking|neft|rtgs|imps|bank\s*transfer/i.test(text)) return "Bank Transfer";
+  if (/cash/i.test(text)) return "Cash";
+  return "Unknown";
+}
+
+function classifyReceiptLocal(text) {
+  if (/restaurant|food|meal|cafe|coffee|pizza|burger|swiggy|zomato|lunch|dinner|breakfast/i.test(text)) return "Food & Beverage";
+  if (/uber|ola|taxi|cab|auto|metro|bus|rapido/i.test(text)) return "Conveyance";
+  if (/petrol|diesel|fuel|hp\s*petrol|indian\s*oil|bharat\s*petroleum/i.test(text)) return "Fuel";
+  if (/hotel|lodge|inn|stay|accommodation|check.in/i.test(text)) return "Accommodation";
+  if (/flight|airfare|airline|indigo|spicejet|airindia|boarding/i.test(text)) return "Air Travel";
+  if (/train|irctc|railway/i.test(text)) return "Rail Travel";
+  if (/parking|toll/i.test(text)) return "Parking";
+  if (/medical|pharmacy|medicine|hospital|clinic|doctor/i.test(text)) return "Medical";
+  if (/mobile|recharge|internet|broadband|airtel|jio|vodafone/i.test(text)) return "Telecom";
+  return "Other";
+}
+
+function extractLineItemsLocal(text) {
+  return text.split("\n").map(l=>l.trim()).filter(l=>l.length>3&&l.length<60&&!/^(total|gst|tax|date|time|invoice|receipt|thank|www\.)/i.test(l)&&/[a-zA-Z]/.test(l)).slice(0,5).join(", ").slice(0,200);
+}
+
+function extractPatternLocal(text, patterns) {
+  for (const p of patterns) {
+    if (p instanceof RegExp) { const m=text.match(p); if(m?.[1]) return m[1].trim(); }
+  }
+  return null;
+}
+
+function calcDistanceLocal(origin, dest) {
+  const AP = {
+    "BOM":[19.0896,72.8656],"DEL":[28.5562,77.1000],"BLR":[13.1986,77.7066],
+    "MAA":[12.9941,80.1709],"HYD":[17.2403,78.4294],"CCU":[22.6520,88.4463],
+    "AMD":[23.0771,72.6347],"GOI":[15.3808,73.8314],"PNQ":[18.5822,73.9197],
+    "COK":[10.1520,76.4019],"TRV":[8.4821,76.9201],"JAI":[26.8242,75.8122],
+    "LKO":[26.7606,80.8893],"DXB":[25.2532,55.3657],"AUH":[24.4330,54.6511],
+    "DOH":[25.2731,51.6080],"SIN":[1.3644,103.9915],"KUL":[2.7456,101.7099],
+    "BKK":[13.6811,100.7475],"LHR":[51.4775,-0.4614],"CDG":[49.0097,2.5479],
+    "JFK":[40.6413,-73.7781],"LAX":[33.9425,-118.4081],"SYD":[-33.9399,151.1753],
   };
-  const res = await fetch(API_URL, {
-    method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)
-  });
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`API error ${res.status}: ${errText.slice(0,200)}`);
-  }
-  const d = await res.json();
-  if (d.error) throw new Error(d.error.message || d.error);
-  const allText = (d.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
-  const cleaned = allText.replace(/```json\n?|```/g,"").trim();
-  if (!cleaned) throw new Error("Empty response");
-  const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error("No JSON in response");
-  return JSON.parse(jsonMatch[0]);
+  const hav=(a,b,c,d)=>{const R=6371,dL=(c-a)*Math.PI/180,dO=(d-b)*Math.PI/180,x=Math.sin(dL/2)**2+Math.cos(a*Math.PI/180)*Math.cos(c*Math.PI/180)*Math.sin(dO/2)**2;return Math.round(R*2*Math.atan2(Math.sqrt(x),Math.sqrt(1-x)));};
+  const o=(origin||"").toUpperCase().slice(0,3), d=(dest||"").toUpperCase().slice(0,3);
+  return (AP[o]&&AP[d]) ? hav(...AP[o],...AP[d]) : 1000;
 }
+
+function classifyFlightLocal(km) {
+  if(km<500) return "Domestic (<500km)";
+  if(km<1500) return "Short-Haul (500-1500km)";
+  if(km<4000) return "Medium-Haul (1500-4000km)";
+  return "Long-Haul (>4000km)";
+}
+
+function randId() { return Math.random().toString(36).slice(2,8).toUpperCase(); }
+
 
 async function agentExtractExpense(file, b64) {
-  const isImage = file.type.startsWith("image/");
-  const prompt = `You are a corporate expense receipt parser. Look carefully at every part of this receipt image and extract ALL visible information.
-
-CRITICAL: Return ONLY a raw JSON object. No markdown, no code fences, no text before or after. Start your response with { and end with }.
-
-Extract these fields:
-{
-  "invoiceNumber": "the receipt/bill/invoice number printed on the document, or generate AUTO-XXXX if not found",
-  "invoiceDate": "date in YYYY-MM-DD format",
-  "sellerName": "the shop, restaurant, hotel, airline or vendor name",
-  "totalAmount": "the final total amount paid as a number only, no currency symbol",
-  "taxAmount": "tax amount as number only, or 0",
-  "currency": "INR or USD or EUR etc",
-  "receiptType": "Food & Beverage or Conveyance or Accommodation or Air Travel or Rail Travel or Fuel or Parking or Office Supplies or Telecom or Medical or Entertainment or Other",
-  "lineItems": "brief list of items purchased",
-  "gstNumber": "GST or VAT registration number if shown, else empty string",
-  "paymentMode": "Cash or Card or UPI or Bank Transfer or Other or Unknown",
-  "validationIssues": [],
-  "agentNotes": "any useful observations",
-  "confidence": "HIGH or MEDIUM or LOW"
-}
-
-Look carefully for: total amount, grand total, amount due, amount paid — these are the most important fields.`;
-
   try {
-    let msgContent;
-    if (isImage) {
-      msgContent = [
-        { type:"image", source:{ type:"base64", media_type:file.type, data:b64 }},
-        { type:"text", text:prompt }
-      ];
+    let text = "";
+    if (file.type.startsWith("image/")) {
+      text = await ocrImage(file, b64);
     } else {
-      const pdfText = await extractPDFText(file);
-      const pdfContent = pdfText.length > 50
-        ? `\n\nDOCUMENT CONTENT:\n---\n${pdfText.slice(0,3000)}\n---`
-        : `\n\n[PDF: ${file.name} — no text extracted]`;
-      msgContent = [{ type:"text", text: prompt + pdfContent }];
+      // PDF — use PDF.js text extraction
+      text = await extractPDFText(file);
     }
-    return await claudeCall([{ role:"user", content: msgContent }]);
+    if (!text || text.length < 10) throw new Error("No text extracted from document");
+    return {
+      invoiceNumber:    extractInvoiceNoLocal(text),
+      invoiceDate:      extractDate(text) || today(),
+      sellerName:       extractSeller(text),
+      totalAmount:      extractAmount(text),
+      taxAmount:        extractTaxLocal(text),
+      currency:         extractCurrencyLocal(text),
+      receiptType:      classifyReceiptLocal(text),
+      lineItems:        extractLineItemsLocal(text),
+      gstNumber:        extractGSTLocal(text),
+      paymentMode:      extractPaymentLocal(text),
+      validationIssues: extractAmount(text)==="0" ? ["Amount not detected — please enter manually"] : [],
+      agentNotes:       `OCR extracted ${text.length} characters`,
+      confidence:       extractAmount(text)!=="0" && extractSeller(text)!=="Unknown" ? "HIGH" : extractAmount(text)!=="0" ? "MEDIUM" : "LOW"
+    };
   } catch(err) {
-    console.error("Expense extraction error:", err.message);
-    return { invoiceNumber:`AUTO-${uid()}`, invoiceDate:today(), sellerName:"Unknown", totalAmount:"0", taxAmount:"0", currency:"INR", receiptType:"Other", lineItems:"", gstNumber:"", paymentMode:"Unknown", validationIssues:["Extraction failed: " + err.message], agentNotes:"", confidence:"LOW" };
+    return { invoiceNumber:`AUTO-${randId()}`, invoiceDate:today(), sellerName:"Unknown", totalAmount:"0", taxAmount:"0", currency:"INR", receiptType:"Other", lineItems:"", gstNumber:"", paymentMode:"Unknown", validationIssues:["OCR failed: "+err.message], agentNotes:"", confidence:"LOW" };
   }
 }
 
+
 async function agentExtractTravel(file, b64, employeeName) {
-  const isImage = file.type.startsWith("image/");
+  // Carbon calc constants
+  const FLIGHT_EF = {"Domestic (<500km)":0.255,"Short-Haul (500-1500km)":0.156,"Medium-Haul (1500-4000km)":0.131,"Long-Haul (>4000km)":0.148};
+  const CABIN_EF  = {"Economy":1,"Premium Economy":1.6,"Business":2.9,"First":4};
 
-  // Carbon emission constants
-  const FLIGHT_EF_MAP = {
-    "Domestic (<500km)": 0.255,
-    "Short-Haul (500-1500km)": 0.156,
-    "Medium-Haul (1500-4000km)": 0.131,
-    "Long-Haul (>4000km)": 0.148
-  };
-  const CABIN_EF = { "Economy":1, "Premium Economy":1.6, "Business":2.9, "First":4 };
-
-  const calcCarbon = (ext) => {
+  const calcCarbon = (travelType, flight, hotel) => {
     try {
-      if (ext.travelType === "Flight" && ext.flight) {
-        const f = ext.flight;
-        const ef = FLIGHT_EF_MAP[f.flightCategory] || 0.15;
-        const cm = CABIN_EF[f.cabinClass] || 1;
-        const dist = parseFloat(f.estimatedDistanceKm) || 1000;
-        const pax  = parseInt(f.passengers) || 1;
-        const co2  = Math.round(ef * cm * dist * pax);
-        return {
-          co2_kg: co2,
-          co2_per_person_kg: Math.round(co2 / pax),
-          methodology: `ICAO ${f.flightCategory} (${ef} kg/km) × ${f.cabinClass} ${cm}x × ${dist}km × ${pax} pax`,
-          offset_cost_usd: Math.round(co2 / 1000 * 15 * 100) / 100,
-          equivalent: `≈ driving ${Math.round(co2 * 4)} km by car`
-        };
-      } else if (ext.travelType === "Hotel" && ext.hotel) {
-        const nights = parseInt(ext.hotel.nights) || 1;
-        const guests = parseInt(ext.hotel.guests) || 1;
-        const co2 = 22 * nights * guests;
-        return {
-          co2_kg: co2,
-          co2_per_person_kg: Math.round(co2 / guests),
-          methodology: `Green Key: 22 kg CO₂/room/night × ${nights} nights × ${guests} guest(s)`,
-          offset_cost_usd: Math.round(co2 / 1000 * 15 * 100) / 100,
-          equivalent: `≈ driving ${Math.round(co2 * 4)} km by car`
-        };
+      if (travelType==="Flight" && flight) {
+        const ef=FLIGHT_EF[flight.flightCategory]||0.15, cm=CABIN_EF[flight.cabinClass]||1;
+        const dist=parseFloat(flight.estimatedDistanceKm)||1000, pax=parseInt(flight.passengers)||1;
+        const co2=Math.round(ef*cm*dist*pax);
+        return { co2_kg:co2, co2_per_person_kg:Math.round(co2/pax), methodology:`ICAO ${flight.flightCategory} × ${flight.cabinClass} ${cm}x × ${dist}km`, offset_cost_usd:Math.round(co2/1000*15*100)/100, equivalent:`≈ driving ${Math.round(co2*4)} km` };
+      } else if (travelType==="Hotel" && hotel) {
+        const nights=parseInt(hotel.nights)||1, guests=parseInt(hotel.guests)||1, co2=22*nights*guests;
+        return { co2_kg:co2, co2_per_person_kg:Math.round(co2/guests), methodology:`Green Key: 22kg/room/night × ${nights} nights`, offset_cost_usd:Math.round(co2/1000*15*100)/100, equivalent:`≈ driving ${Math.round(co2*4)} km` };
       }
     } catch {}
     return { co2_kg:0, co2_per_person_kg:0, methodology:"Insufficient data", offset_cost_usd:0, equivalent:"—" };
   };
 
-  const prompt = `You are a corporate travel document parser. The logged-in employee is: "${employeeName}".
-
-Look carefully at every detail in this travel document (flight e-ticket, boarding pass, hotel booking, or itinerary).
-
-CRITICAL: Return ONLY a raw JSON object. Start your response with { and end with }. No markdown, no code fences, no text before or after.
-
-{
-  "travelType": "Flight or Hotel",
-  "passengerName": "exact full name printed on the document",
-  "nameMatchesEmployee": true or false,
-  "nameMatchNote": "brief reason why names match or not",
-  "flight": {
-    "origin": "departure city or airport code",
-    "destination": "arrival city or airport code",
-    "flightNumber": "airline code + number e.g. AI864",
-    "cabinClass": "Economy or Premium Economy or Business or First",
-    "departureDate": "YYYY-MM-DD",
-    "returnDate": "YYYY-MM-DD or null",
-    "passengers": 1,
-    "estimatedDistanceKm": 1200,
-    "flightCategory": "Domestic (<500km) or Short-Haul (500-1500km) or Medium-Haul (1500-4000km) or Long-Haul (>4000km)",
-    "pnr": "booking reference or PNR code",
-    "ticketCost": "total fare amount as number only",
-    "currency": "INR or USD etc",
-    "invoiceNumber": "ticket number or booking ID"
-  },
-  "hotel": {
-    "hotelName": "hotel name",
-    "city": "city name",
-    "checkIn": "YYYY-MM-DD",
-    "checkOut": "YYYY-MM-DD",
-    "nights": 1,
-    "roomType": "Standard or Deluxe etc",
-    "guests": 1,
-    "bookingRef": "booking reference",
-    "cost": "total cost as number only",
-    "currency": "INR or USD etc",
-    "invoiceNumber": "booking number"
-  },
-  "validationIssues": [],
-  "agentNotes": "observations",
-  "confidence": "HIGH or MEDIUM or LOW"
-}
-
-Rules:
-1. Set flight to null for hotel documents. Set hotel to null for flight documents.
-2. For Mumbai-Delhi flights, estimatedDistanceKm is approximately 1150.
-3. If passengerName does not match "${employeeName}", add that to validationIssues.
-4. Fill every field you can see — ticketCost and totalAmount are the most important.`;
-
   try {
-    let msgContent;
-
-    if (isImage) {
-      // Images: send as base64 image
-      msgContent = [
-        { type:"image", source:{ type:"base64", media_type:file.type, data:b64 }},
-        { type:"text", text:prompt }
-      ];
+    let text = "";
+    if (file.type.startsWith("image/")) {
+      text = await ocrImage(file, b64);
     } else {
-      // PDF — use PDF.js to extract real text content
-      const pdfText = await extractPDFText(file);
+      text = await extractPDFText(file);
+    }
+    if (!text || text.length < 10) throw new Error("No text extracted");
 
-      const pdfContent = pdfText.length > 100
-        ? `\n\nDOCUMENT CONTENT FROM PDF:\n---\n${pdfText.slice(0, 4000)}\n---`
-        : `\n\n[PDF file: ${file.name} — no readable text could be extracted]`;
+    const isFlight = /flight|airline|pnr|boarding|depart|arriv|[A-Z]{2}\d{3}/i.test(text);
+    const passenger = extractPatternLocal(text,[/passenger(?:\s*name)?[:\s]+([A-Za-z ]{3,40})/i,/(?:mr\.|ms\.|mrs\.)\s+([A-Za-z ]{3,40})/i,/name[:\s]+([A-Za-z ]{3,40})/i]) || "";
+    const nameMatch = !!passenger && !!employeeName && passenger.toLowerCase().split(" ").some(w=>employeeName.toLowerCase().includes(w)&&w.length>2);
+    const pnr = extractPatternLocal(text,[/pnr[:\s#]*([A-Z0-9]{5,8})/i,/booking\s*(?:ref|id|no)[:\s#]*([A-Z0-9]{5,12})/i]) || "";
+    const date = extractDate(text);
+    const amount = extractAmount(text);
+    const curr = extractCurrencyLocal(text);
+    const invNo = extractPatternLocal(text,[/ticket\s*(?:no|#)[:\s]*([A-Z0-9\-]{4,15})/i,/invoice\s*(?:no|#)[:\s]*([A-Z0-9\-]{4,15})/i]) || pnr || `TRV-${randId()}`;
 
-      msgContent = [{ type:"text", text: prompt + pdfContent }];
+    let flight = null, hotel = null;
+
+    if (isFlight) {
+      const routeM = text.match(/([A-Z]{3})\s*(?:→|->|to|-)\s*([A-Z]{3})/i);
+      const origin = routeM ? routeM[1].toUpperCase() : extractPatternLocal(text,[/(?:from|origin|departure)[:\s]+([A-Z]{3})/i]) || "";
+      const dest   = routeM ? routeM[2].toUpperCase() : extractPatternLocal(text,[/(?:to|destination|arrival)[:\s]+([A-Z]{3})/i]) || "";
+      const flightNum = (text.match(/\b([A-Z]{2}\s*\d{3,4})\b/) || [])[1] || "";
+      const cabin  = /business/i.test(text)?"Business":/first\s*class/i.test(text)?"First":/premium/i.test(text)?"Premium Economy":"Economy";
+      const distKm = calcDistanceLocal(origin, dest);
+      const category = classifyFlightLocal(distKm);
+      flight = { origin, destination:dest, flightNumber:flightNum.replace(/\s/g,""), cabinClass:cabin, departureDate:date||today(), returnDate:null, passengers:1, estimatedDistanceKm:distKm, flightCategory:category, pnr, ticketCost:amount, currency:curr, invoiceNumber:invNo };
+    } else {
+      const hotelName = extractPatternLocal(text,[/(?:hotel|resort|inn|lodge)[:\s]+([A-Za-z &]{3,40})/i]) || extractSeller(text);
+      const nights = parseInt((text.match(/(\d+)\s*night/i)||[])[1]||"1");
+      const roomType = (text.match(/(deluxe|standard|suite|superior)/i)||[])[1]||"Standard";
+      hotel = { hotelName:hotelName.trim().slice(0,50), city:extractPatternLocal(text,[/city[:\s]+([A-Za-z ]+)/i])||"", checkIn:date||today(), checkOut:"", nights, roomType, guests:1, bookingRef:pnr, cost:amount, currency:curr, invoiceNumber:invNo };
     }
 
-    const ext = await claudeCall([{ role:"user", content: msgContent }]);
+    const carbon = calcCarbon(isFlight?"Flight":"Hotel", flight, hotel);
+    const issues = [];
+    if (amount==="0") issues.push("Cost not detected — please enter manually");
+    if (passenger && !nameMatch) issues.push(`Name mismatch: document shows "${passenger}" but employee is "${employeeName}"`);
 
-    // Always recalculate carbon locally for accuracy — override AI carbon
-    ext.carbon = calcCarbon(ext);
-
-    // Name validation
-    const issues = Array.isArray(ext.validationIssues) ? ext.validationIssues : [];
-    if (ext.passengerName && !ext.nameMatchesEmployee) {
-      const alreadyFlagged = issues.some(i => i.toLowerCase().includes("name"));
-      if (!alreadyFlagged) {
-        issues.push(`Name mismatch: document shows "${ext.passengerName}" but logged-in employee is "${employeeName}"`);
-      }
-    }
-    ext.validationIssues = issues;
-    return ext;
-
-  } catch(err) {
     return {
-      travelType:"Flight", passengerName:"", nameMatchesEmployee:false,
-      nameMatchNote:"Extraction failed: " + (err.message||"unknown error"),
-      flight:null, hotel:null,
-      carbon:{ co2_kg:0, co2_per_person_kg:0, methodology:"Failed", offset_cost_usd:0, equivalent:"—" },
-      validationIssues:["AI extraction failed — please fill in the details manually and submit"],
-      agentNotes:"", confidence:"LOW"
+      travelType: isFlight?"Flight":"Hotel",
+      passengerName: passenger, nameMatchesEmployee: nameMatch,
+      nameMatchNote: nameMatch?"Name verified":passenger?`"${passenger}" vs "${employeeName}"`:"No name found",
+      flight, hotel, carbon,
+      validationIssues: issues,
+      agentNotes: `OCR extracted ${text.length} characters`,
+      confidence: (isFlight?(flight?.origin&&flight?.destination):hotel?.hotelName!=="Unknown") ? "HIGH" : "MEDIUM"
     };
+  } catch(err) {
+    return { travelType:"Flight", passengerName:"", nameMatchesEmployee:false, nameMatchNote:"Extraction failed", flight:null, hotel:null, carbon:{co2_kg:0,co2_per_person_kg:0,methodology:"Failed",offset_cost_usd:0,equivalent:"—"}, validationIssues:["OCR failed: "+err.message], agentNotes:"", confidence:"LOW" };
   }
 }
 
 
-// ─── PDF text extractor using PDF.js ─────────────────────────────────────────
 async function extractPDFText(file) {
   return new Promise((resolve) => {
     const reader = new FileReader();
