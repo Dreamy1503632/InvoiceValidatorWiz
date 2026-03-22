@@ -57,8 +57,15 @@ async function loadTesseract() {
   if (window.Tesseract) return window.Tesseract;
   await new Promise((res, rej) => {
     const s = document.createElement("script");
-    s.src = "https://unpkg.com/tesseract.js@5/dist/tesseract.min.js";
-    s.onload = res; s.onerror = rej;
+    s.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+    s.onload = res;
+    s.onerror = () => {
+      // fallback CDN
+      const s2 = document.createElement("script");
+      s2.src = "https://unpkg.com/tesseract.js@5/dist/tesseract.min.js";
+      s2.onload = res; s2.onerror = rej;
+      document.head.appendChild(s2);
+    };
     document.head.appendChild(s);
   });
   return window.Tesseract;
@@ -68,10 +75,37 @@ async function loadTesseract() {
 async function ocrImage(file, b64) {
   try {
     const Tesseract = await loadTesseract();
-    const imageData = `data:${file.type};base64,${b64}`;
-    const result = await Tesseract.recognize(imageData, "eng", { logger: () => {} });
-    return result.data.text || "";
+
+    // Create a blob URL — more reliable than data URL for Tesseract
+    const byteChars = atob(b64);
+    const byteArr = new Uint8Array(byteChars.length);
+    for (let i = 0; i < byteChars.length; i++) byteArr[i] = byteChars.charCodeAt(i);
+    const blob = new Blob([byteArr], { type: file.type });
+    const blobUrl = URL.createObjectURL(blob);
+
+    try {
+      // Use createWorker for more reliable operation
+      const worker = await Tesseract.createWorker("eng", 1, {
+        workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/worker.min.js",
+        corePath:   "https://cdn.jsdelivr.net/npm/tesseract.js-core@5/tesseract-core-simd-lstm.wasm.js",
+        logger:     () => {}
+      });
+      const { data: { text } } = await worker.recognize(blobUrl);
+      await worker.terminate();
+      URL.revokeObjectURL(blobUrl);
+      return text || "";
+    } catch {
+      // Fallback: try simpler recognize API
+      URL.revokeObjectURL(blobUrl);
+      const result = await Tesseract.recognize(
+        `data:${file.type};base64,${b64}`,
+        "eng",
+        { logger: () => {} }
+      );
+      return result.data.text || "";
+    }
   } catch(e) {
+    console.error("OCR error:", e.message);
     return "";
   }
 }
@@ -257,11 +291,31 @@ async function agentExtractExpense(file, b64) {
     let text = "";
     if (file.type.startsWith("image/")) {
       text = await ocrImage(file, b64);
+      // If Tesseract fails, try raw byte extraction
+      if (!text || text.length < 5) {
+        const rawText = await new Promise(resolve => {
+          const reader = new FileReader();
+          reader.onload = e => {
+            try {
+              const bytes = new Uint8Array(e.target.result);
+              const decoded = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+              const chunks = decoded.match(/[\x20-\x7E\n\r]{4,}/g) || [];
+              resolve(chunks.filter(c => /[a-zA-Z]{2,}/.test(c)).join("\n").slice(0, 4000));
+            } catch { resolve(""); }
+          };
+          reader.onerror = () => resolve("");
+          reader.readAsArrayBuffer(file);
+        });
+        text = rawText;
+      }
     } else {
-      // PDF — use PDF.js text extraction
       text = await extractPDFText(file);
     }
-    if (!text || text.length < 10) throw new Error("No text extracted from document");
+
+    if (!text || text.length < 5) {
+      return { invoiceNumber:`AUTO-${randId()}`, invoiceDate:today(), sellerName:"Unknown", totalAmount:"0", taxAmount:"0", currency:"INR", receiptType:"Other", lineItems:"", gstNumber:"", paymentMode:"Unknown", validationIssues:["⚠️ Could not extract text — please fill details manually"], agentNotes:"OCR returned no text", confidence:"LOW" };
+    }
+
     return {
       invoiceNumber:    extractInvoiceNoLocal(text),
       invoiceDate:      extractDate(text) || today(),
@@ -306,11 +360,41 @@ async function agentExtractTravel(file, b64, employeeName) {
   try {
     let text = "";
     if (file.type.startsWith("image/")) {
+      // Try Tesseract OCR with a longer timeout allowance
       text = await ocrImage(file, b64);
+      // If Tesseract failed, try reading as raw bytes (works for some image types)
+      if (!text || text.length < 5) {
+        const rawText = await new Promise(resolve => {
+          const reader = new FileReader();
+          reader.onload = e => {
+            try {
+              const bytes = new Uint8Array(e.target.result);
+              const decoded = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+              const chunks = decoded.match(/[\x20-\x7E\n\r]{4,}/g) || [];
+              resolve(chunks.filter(c => /[a-zA-Z]{2,}/.test(c)).join("\n").slice(0, 4000));
+            } catch { resolve(""); }
+          };
+          reader.onerror = () => resolve("");
+          reader.readAsArrayBuffer(file);
+        });
+        text = rawText;
+      }
     } else {
       text = await extractPDFText(file);
     }
-    if (!text || text.length < 10) throw new Error("No text extracted");
+
+    if (!text || text.length < 5) {
+      // Return empty travel record with helpful message instead of throwing
+      return {
+        travelType:"Flight", passengerName:"", nameMatchesEmployee:false,
+        nameMatchNote:"Could not read document",
+        flight:{ origin:"", destination:"", flightNumber:"", cabinClass:"Economy", departureDate:today(), returnDate:null, passengers:1, estimatedDistanceKm:1000, flightCategory:"Short-Haul (500-1500km)", pnr:"", ticketCost:"0", currency:"INR", invoiceNumber:`TRV-${randId()}` },
+        hotel:null,
+        carbon:{ co2_kg:0, co2_per_person_kg:0, methodology:"No data", offset_cost_usd:0, equivalent:"—" },
+        validationIssues:["⚠️ Could not extract text from this document. Please fill in the fields manually."],
+        agentNotes:"OCR returned no text — please enter details manually", confidence:"LOW"
+      };
+    }
 
     const isFlight = /flight|airline|pnr|boarding|depart|arriv|[A-Z]{2}\d{3}/i.test(text);
     const passenger = extractPatternLocal(text,[/passenger(?:\s*name)?[:\s]+([A-Za-z ]{3,40})/i,/(?:mr\.|ms\.|mrs\.)\s+([A-Za-z ]{3,40})/i,/name[:\s]+([A-Za-z ]{3,40})/i]) || "";
