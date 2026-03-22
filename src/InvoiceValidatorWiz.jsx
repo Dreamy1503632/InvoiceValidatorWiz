@@ -115,11 +115,55 @@ function extractDate(text) {
 }
 
 function extractSeller(text) {
-  const skip = /^(tax|invoice|receipt|bill|date|time|amount|total|gst|phone|tel|email|address|thank|welcome|\d|#|www\.|http)/i;
-  for (const line of text.split("\n").slice(0,6).map(l=>l.trim()).filter(l=>l.length>2&&l.length<=60)) {
-    if (!skip.test(line)) return line.replace(/\s*(pvt\.?\s*ltd\.?|limited|llp|llc|inc\.?)$/i,"").trim();
+  const lines = text.split("\n").map(l => l.trim()).filter(l => l.length > 1);
+
+  // Lines that are clearly NOT a business name
+  const skipLine = l =>
+    /^[\d\s\+\-\(\)\/\,\.]+$/.test(l) ||           // pure numbers/phone
+    /^(tax|invoice|receipt|bill|date|time|amount|total|gst|gstin|phone|tel|mobile|email|address|addr|thank|welcome|subtotal|qty|item|description|sl\.?\s*no|sr\.?\s*no|s\.no|cash|card|upi|paid|balance|change|due|discount|no\.|#)/i.test(l) ||
+    /www\.|http|@/.test(l) ||                        // URLs / emails
+    /^\*+$|^-+$|^=+$/.test(l) ||                    // separator lines
+    l.length < 3 || l.length > 80;
+
+  // Score a line on how likely it is to be a business name
+  const score = l => {
+    let s = 0;
+    if (/[A-Z][a-z]/.test(l)) s += 3;               // Mixed case (proper noun)
+    if (/\b(restaurant|hotel|cafe|store|shop|pvt|ltd|llp|foods|services|solutions|enterprises|traders|agencies|associates|medical|pharmacy|petrol|filling|station|supermarket|mart|express|kitchen|house|palace|garden|centre|center|international|india|technologies|tech|systems)\b/i.test(l)) s += 5;
+    if (/^[A-Z][A-Z\s&'\.]{2,}$/.test(l)) s += 2;  // ALL CAPS name
+    if (l.split(" ").length >= 2 && l.split(" ").length <= 6) s += 2; // 2-6 words
+    if (/\d/.test(l)) s -= 2;                        // Has numbers (less likely)
+    if (l.length > 10 && l.length < 50) s += 1;
+    return s;
+  };
+
+  // Strategy 1: Look for labeled merchant/seller field anywhere in doc
+  const labeled = extractPatternLocal(text, [
+    /(?:merchant|vendor|seller|billed\s*by|sold\s*by|store\s*name|shop\s*name|restaurant\s*name)[:\s]+([A-Za-z0-9 &'\-\.]{3,60})/i,
+    /(?:from|issuer)[:\s]+([A-Za-z][A-Za-z0-9 &'\-\.]{2,50})/i,
+  ]);
+  if (labeled && labeled.length > 2) return labeled.replace(/\s*(pvt\.?\s*ltd\.?|limited|llp|llc|inc\.?)$/i,"").trim();
+
+  // Strategy 2: Score lines in the first 8 lines (header area)
+  const candidates = lines
+    .slice(0, 8)
+    .filter(l => !skipLine(l))
+    .map(l => ({ line: l, score: score(l) }))
+    .filter(c => c.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  if (candidates.length > 0) {
+    return candidates[0].line
+      .replace(/\s*(pvt\.?\s*ltd\.?|limited|llp|llc|inc\.?)$/i, "")
+      .trim();
   }
-  return extractPatternLocal(text,[/(?:merchant|vendor|seller|billed\s*by)[:\s]+([A-Za-z &']{3,50})/i]) || "Unknown";
+
+  // Strategy 3: Just take first non-skipped line as last resort
+  for (const line of lines.slice(0, 10)) {
+    if (!skipLine(line)) return line.replace(/\s*(pvt\.?\s*ltd\.?|limited|llp|llc|inc\.?)$/i,"").trim();
+  }
+
+  return "Unknown";
 }
 
 function extractInvoiceNoLocal(text) {
